@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice to MIDI Recorder</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f4f7f6;
+            color: #333;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 20px;
+            text-align: center;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        h1 { color: #2c3e50; margin-bottom: 10px; }
+        p { color: #7f8c8d; margin-bottom: 30px; }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            font-weight: bold;
+            border-radius: 30px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        button:hover { background-color: #2980b9; transform: translateY(-1px); }
+        button:disabled { background-color: #bdc3c7; cursor: not-allowed; transform: none; }
+        #stopBtn { background-color: #e74c3c; }
+        #stopBtn:hover { background-color: #c0392b; }
+        #status {
+            margin-top: 20px;
+            font-weight: 500;
+            color: #16a085;
+        }
+        .visualizer {
+            width: 100%;
+            height: 60px;
+            background-color: #ecf0f1;
+            margin-top: 20px;
+            border-radius: 6px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #bar {
+            width: 0%;
+            height: 100%;
+            background-color: #2ecc71;
+            transition: width 0.1s linear;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Voice to MIDI</h1>
+    <p>Hum or sing a melody to generate a MIDI file directly in your browser.</p>
+    
+    <button id="startBtn">🎤 Start Recording</button>
+    <button id="stopBtn" disabled>⏹️ Stop & Convert</button>
+    
+    <div class="visualizer">
+        <div id="bar"></div>
+    </div>
+    
+    <div id="status">Ready to record</div>
+</div>
+
+<script>
+    let audioContext;
+    let audioWorkletNode;
+    let mediaStream;
+    let source;
+    let recording = false;
+    let pitches = [];
+    let sampleRate = 44100;
+    
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const status = document.getElementById('status');
+    const bar = document.getElementById('bar');
+
+    startBtn.addEventListener('click', startRecording);
+    stopBtn.addEventListener('click', stopRecording);
+
+    async function startRecording() {
+        pitches = [];
+        recording = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        status.textContent = "Listening... Hum or sing clearly!";
+        bar.style.width = "0% document";
+        
+        // Setup Web Audio API
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        sampleRate = audioContext.sampleRate;
+        
+        try {
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            source = audioContext.createMediaStreamSource(mediaStream);
+            
+            // Create script processor for simple real-time autocorrelation pitch tracking
+            const bufferSize = 2048;
+            const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+            
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+            
+            let progress = 0;
+            processor.onaudioprocess = function(e) {
+                if (!recording) return;
+                
+                const inputData = e.inputBuffer.getChannelData(0);
+                
+                // Track visual meter progress
+                progress = (progress + 1) % 100;
+                bar.style.width = Math.max(10, progress) + "%";
+                
+                // Simple autocorrelation pitch detection
+                let pitch = autoCorrelate(inputData, sampleRate);
+                if (pitch !== -1 && pitch >= 80 && pitch <= 800) {
+                    let midiNote = Math.round(12 * Math.log2(pitch / 440) + 69);
+                    pitches.push({ note: midiNote, time: audioContext.currentTime });
+                } else {
+                    pitches.push({ note: null, time: audioContext.currentTime });
+                }
+            };
+            
+            // Store processor reference globally so it doesn't get garbage collected
+            window.activeProcessor = processor;
+            
+        } catch (err) {
+            console.error(err);
+            status.textContent = "Error accessing microphone. Check permissions.";
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        }
+    }
+
+    function stopRecording() {
+        recording = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        status.textContent = "Processing MIDI...";
+        bar.style.width = "100%";
+        
+        // Stop all audio tracks
+        if (mediaStream) {
+            mediaStream.getTracks().forEach(track => track.stop());
+        }
+        if (audioContext) {
+            audioContext.close();
+        }
+        
+        if (pitches.length === 0) {
+            status.textContent = "No notes detected. Try singing louder!";
+            return;
+        }
+        
+        buildAndDownloadMidi(pitches);
+    }
+
+    // Autocorrelation algorithm to find fundamental frequency
+    function autoCorrelate(buffer, sampleRate) {
+        let SIZE = buffer.length;
+        let rms = 0;
+
+        for (let i = 0; i < SIZE; i++) {
+            let val = buffer[i];
+            rms += val * val;
+        }
+        rms = Math.sqrt(rms / SIZE);
+        if (rms < 0.01) return -1; // Not loud enough
+
+        let r1 = 0, r2 = SIZE - 1;
+        let thres = 0.2;
+        for (let i = 0; i < SIZE / 2; i++) {
+            if (Math.abs(buffer[i]) < thres) { r1 = i; break; }
+        }
+        for (let i = SIZE - 1; i >= SIZE / 2; i--) {
+            if (Math.abs(buffer[i]) < thres) { r2 = i; break; }
+        }
+
+        buffer = buffer.slice(r1, r2);
+        SIZE = buffer.length;
+
+        let c = new Float32Array(SIZE);
+        for (let i = 0; i < SIZE; i++) {
+            for (let j = 0; j < SIZE - i; j++) {
+                c[i] = c[i] + buffer[j] * buffer[j + i];
+            }
+        }
+
+        let d = 0;
+        while (c[d] > c[d + 1]) d++;
+        let maxval = -1, maxpos = -1;
+        for (let i = d; i < SIZE; i++) {
+            if (c[i] > maxval) {
+                maxval = c[i];
+                maxpos = i;
+            }
+        }
+
+        let T0 = maxpos;
+        return sampleRate / T0;
+    }
+
+    // Creates a valid minimal Standard MIDI File format 0 byte array
+    function buildAndDownloadMidi(pitchEvents) {
+        status.textContent = "Generating file...";
+        
+        // Header Chunk
+        const header = [
+            0x4d, 0x54, 0x68, 0x64, // "MThd"
+            0x00, 0x00, 0x00, 0x06, // Chunk size (6)
+            0x00, 0x00,             // Format 0 (single track)
+            0x00, 0x01,             // One track
+            0x01, 0xe0              // 480 ticks per quarter note
+        ];
+        
+        let trackEvents = [];
+        let currentNote = null;
+        let lastTime = pitchEvents[0].time;
+        
+        // Map pitches into standard MIDI sequential note ON / OFF streams
+        pitchEvents.forEach(evt => {
+            let deltaTimeSeconds = evt.time - lastTime;
+            let ticks = Math.round(deltaTimeSeconds * 960); // Roughly maps seconds to MIDI ticks
+            
+            if (evt.note !== currentNote) {
+                if (currentNote !== null) {
+                    // Turn off old note
+                    trackEvents.push(...writeVarInt(ticks)); // Delta time
+                    trackEvents.push(0x80, currentNote, 0x00); // Note Off
+                    ticks = 0; // Reset delta time since we just wrote an event
+                }
+                if (evt.note !== null) {
+                    // Turn on new note
+                    trackEvents.push(...writeVarInt(ticks)); // Delta time
+                    trackEvents.push(0x90, evt.note, 0x40); // Note On (velocity 64)
+                    ticks = 0;
+                }
+                currentNote = evt.note;
+            }
+            lastTime = evt.time;
+        });
+        
+        // Close last note if any
+        if (currentNote !== null) {
+            trackEvents.push(0x00, 0x80, currentNote, 0x00);
+        }
+        
+        // End of track meta event
+        trackEvents.push(0x00, 0xFF, 0x2F, 0x00);
+        
+        // Track Chunk Header
+        const trackHeader = [0x4d, 0x54, 0x72, 0x6b]; // "MTrk"
+        const trackLength = writeLength32(trackEvents.length);
+        
+        const fullMidi = new Uint8Array([...header, ...trackHeader, ...trackLength, ...trackEvents]);
+        
+        // Trigger browser download
+        const blob = new Blob([fullMidi], { type: "audio/midi" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "my_voice_tune.mid";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        status.textContent = "Downloaded successfully! 🎉";
+    </div>
+
+    function writeLength32(value) {
+        return [
+            (value >> 24) & 0xFF,
+            (value >> 16) & 0xFF,
+            (value >> 8) & 0xFF,
+            value & 0xFF
+        ];
+    }
+
+    function writeVarInt(value) {
+        let buffer = [];
+        let bufferVal = value & 0x7F;
+        value = value >> 7;
+        buffer.unshift(bufferVal);
+        while (value > 0) {
+            bufferVal = (value & 0x7F) | 0x80;
+            value = value >> 7;
+            buffer.unshift(bufferVal);
+        }
+        return buffer;
+    }
+</script>
+</body>
+</html>
